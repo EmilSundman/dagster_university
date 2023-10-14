@@ -2,29 +2,37 @@ from dagster import asset
 import plotly.express as px
 import plotly.io as pio
 import geopandas as gpd
+from datetime import datetime, timedelta
+import pandas as pd
 import duckdb
 import os
 from . import constants
+import requests
+from dagster_duckdb import DuckDBResource
+from ..partitions import weekly_partition
 
 @asset(
-    deps=["taxi_trips", "taxi_zones"], 
-    compute_kind="duckdb"
+    deps=["taxi_trips", "taxi_zones"]
 )
-def manhattan_stats():
-    query = """
-        select
-            zones.zone,
-            zones.borough,
-            zones.geometry,
-            count(1) as num_trips,
-        from trips
-        left join zones on trips.pickup_zone_id = zones.zone_id
-        where borough = 'Manhattan' and geometry is not null
-        group by zone, borough, geometry
+def manhattan_stats(database: DuckDBResource):
+    """
+    Metrics on taxi trips in Manhattan
     """
 
-    conn = duckdb.connect(os.getenv("DUCKDB_DATABASE"))
-    trips_by_zone = conn.execute(query).fetch_df()
+    query = """
+    select
+        zones.zone,
+        zones.borough,
+        zones.geometry,
+        count(1) as num_trips,
+    from trips
+    left join zones on trips.pickup_zone_id = zones.zone_id
+    where geometry is not null
+    group by zone, borough, geometry
+    """
+
+    with database.get_connection() as conn:
+        trips_by_zone = conn.execute(query).fetch_df()
 
     trips_by_zone["geometry"] = gpd.GeoSeries.from_wkt(trips_by_zone["geometry"])
     trips_by_zone = gpd.GeoDataFrame(trips_by_zone)
@@ -51,3 +59,49 @@ def manhattan_map():
     )
 
     pio.write_image(fig, constants.MANHATTAN_MAP_FILE_PATH)
+
+@asset(
+    deps=["taxi_trips"],
+    partitions_def=weekly_partition
+)
+def trips_by_week(context, database: DuckDBResource):
+    """
+        The number of trips per week, aggregated by week.
+    """
+
+    period_to_fetch = context.asset_partition_key_for_output()
+
+    # get all trips for the week
+    query = f"""
+        select vendor_id, total_amount, trip_distance, passenger_count
+        from trips
+        where pickup_datetime >= '{period_to_fetch}'
+            and pickup_datetime < '{period_to_fetch}'::date + interval '1 week'
+    """
+
+    with database.get_connection() as conn:
+        data_for_month = conn.execute(query).fetch_df()
+
+    aggregate = data_for_month.agg({
+        "vendor_id": "count",
+        "total_amount": "sum",
+        "trip_distance": "sum",
+        "passenger_count": "sum"
+    }).rename({"vendor_id": "num_trips"}).to_frame().T # type: ignore
+
+    # clean up the formatting of the dataframe
+    aggregate["period"] = period_to_fetch
+    aggregate['num_trips'] = aggregate['num_trips'].astype(int)
+    aggregate['passenger_count'] = aggregate['passenger_count'].astype(int)
+    aggregate['total_amount'] = aggregate['total_amount'].round(2).astype(float)
+    aggregate['trip_distance'] = aggregate['trip_distance'].round(2).astype(float)
+    aggregate = aggregate[["period", "num_trips", "total_amount", "trip_distance", "passenger_count"]]
+
+    try:
+        # If the file already exists, append to it, but replace the existing month's data
+        existing = pd.read_csv(constants.TRIPS_BY_WEEK_FILE_PATH)
+        existing = existing[existing["period"] != period_to_fetch]
+        existing = pd.concat([existing, aggregate]).sort_values(by="period")
+        existing.to_csv(constants.TRIPS_BY_WEEK_FILE_PATH, index=False)
+    except FileNotFoundError:
+        aggregate.to_csv(constants.TRIPS_BY_WEEK_FILE_PATH, index=False)
