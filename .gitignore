@@ -1,1 +1,4 @@
 .venv/*
+.venv_save/*
+*.pyc
+*.db
